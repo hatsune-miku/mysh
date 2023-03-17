@@ -1,1 +1,0 @@
-clang++ CMakeFiles/motd.dir/main.cpp.o -o motd  -lncurses 
