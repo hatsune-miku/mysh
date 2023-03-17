@@ -8,12 +8,17 @@ set(
     SHSH_SRC
 
     main.cpp
-    config.h env/env.cpp env/env.h shell/shell.cpp shell/shell.h util/env_util.cpp util/env_util.h)
+    env/env.cpp 
+    shell/shell.cpp 
+    util/env_util.cpp
+    util/string_util.cpp
+    util/sig_util.cpp
+)
 
 include_directories(
     .
 )
 
-link_libraries(ncurses)
+add_subdirectory(motd)
 
 add_executable(shsh ${SHSH_SRC})

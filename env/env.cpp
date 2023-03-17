@@ -5,12 +5,13 @@
 #include "env.h"
 
 env::env() {
-    buffer = new std::string();
+    output_buffer = new std::string();
     input_buffer = new std::string();
+    child_process_id = -1;
     cursor = 0;
 }
 
 env::~env() {
-    delete buffer;
+    delete output_buffer;
     delete input_buffer;
 }

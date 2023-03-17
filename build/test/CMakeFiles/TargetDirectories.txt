@@ -1,0 +1,9 @@
+/home/miku/project/mysh/build/test/CMakeFiles/shsh.dir
+/home/miku/project/mysh/build/test/CMakeFiles/edit_cache.dir
+/home/miku/project/mysh/build/test/CMakeFiles/rebuild_cache.dir
+/home/miku/project/mysh/build/test/motd/CMakeFiles/motd.dir
+/home/miku/project/mysh/build/test/motd/CMakeFiles/edit_cache.dir
+/home/miku/project/mysh/build/test/motd/CMakeFiles/rebuild_cache.dir
+/home/miku/project/mysh/build/test/test/CMakeFiles/test.dir
+/home/miku/project/mysh/build/test/test/CMakeFiles/edit_cache.dir
+/home/miku/project/mysh/build/test/test/CMakeFiles/rebuild_cache.dir

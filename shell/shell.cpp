@@ -10,8 +10,14 @@
 #include <cstdio>
 #include <unistd.h>
 #include <sys/wait.h>
-#include <ncurses.h>
+#include <termios.h>
+#include <unistd.h>
+#include <iomanip>
+#include <sys/ioctl.h>
+
 #include "util/env_util.h"
+#include "util/string_util.h"
+#include "util/sig_util.h"
 
 using std::vector;
 using std::string;
@@ -19,8 +25,50 @@ using std::string;
 constexpr int STATUS_NOTHING_TO_DO = -1;
 constexpr int STATUS_EXIT = 0;
 
-int execute(const vector<std::string> &args) {
+auto& ttyout = std::cout;
+auto& ttyerr = std::cerr;
 
+struct termios termios_backup;
+std::function<void(int sig)> signal_proxy;
+
+static void signal_proxy_wrapper(int sig) {
+    signal_proxy(sig);
+}
+
+static void disable_raw_mode() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &termios_backup);
+}
+
+static void enable_raw_mode() {
+    tcgetattr(STDIN_FILENO, &termios_backup);
+    atexit(disable_raw_mode);
+    struct termios raw = termios_backup;
+
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1;
+
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+int get_console_width() {
+    // TIOCGWINSZ: Terminal Input/Output Control Get Window Size
+    // Who invented this super cool name?
+    struct winsize w;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+    return w.ws_col;
+}
+
+static char read_key() {
+    char c;
+    read(STDIN_FILENO, &c, 1);
+    return c;
+}
+
+static int execute(env* e, const vector<std::string>& args) {
     char* argv[args.size() + 1];
     for (size_t i = 0; i < args.size(); i++) {
         argv[i] = (char*) args[i].c_str();
@@ -32,44 +80,65 @@ int execute(const vector<std::string> &args) {
         perror("fork");
         exit(EXIT_FAILURE);
     } else if (pid == 0) {
-        execvp(argv[0], argv);
-        perror("execvp");
-        exit(EXIT_FAILURE);
-    } else {
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status)) {
-            return WEXITSTATUS(status);
-        } else {
-            return -1;
-        }
+        exit(execvp(argv[0], argv));
     }
+
+    int status;
+    e->child_process_id = pid;
+    waitpid(pid, &status, WUNTRACED);
+    return status;
 }
 
-void handle_line(const std::string &line) {
-    vector<std::string> args; // = line.split(" ");
-    if (args[0] == CONFIG_COMMAND_EXIT) {
-    } else if (args[0] == CONFIG_COMMAND_CHDIR) {
-        if (args.size() == 1) {
-            chdir(getenv(CONFIG_ENV_HOME));
-        } else {
-            chdir(args[1].c_str());
-        }
-    } else {
-        int status = execute(args);
-        if (status == -1) {
-            std::cerr << "Error executing command" << std::endl;
-        } else {
-            std::cout << "Command returned status " << status << std::endl;
-        }
+/**
+ * Handle a line of input
+ * Returns true if the line was actually handled
+ * Returns false if the line was empty
+*/
+static bool handle_line(env* e, const std::string& line) {
+    const std::string_view trimmed_view = string_strip(line);
+    const std::string trimmed(trimmed_view.begin(), trimmed_view.end());
+    if (trimmed.empty()) {
+        return false;
     }
+
+    const vector<std::string> args = string_split(trimmed, " ");
+    if(args.size() == 0) {
+        return false;
+    }
+
+    int code = execute(e, args);
+
+    if (WIFEXITED(code)) {
+        switch (WEXITSTATUS(code)) {
+        case 0:
+            break;
+        case 255:
+            ttyerr << args[0] << ": Command not found" << "\n";
+            break;
+        default:
+            ttyerr << "Exited with code " << WEXITSTATUS(code) << "\n";
+            break;
+        }
+    } else if (WIFSIGNALED(code)) {
+        ttyerr << "Killed by signal " << WTERMSIG(code)
+            << " (" << strsignal(WTERMSIG(code)) << ")" << "\n";
+    } else if (WIFSTOPPED(code)) {
+        ttyerr << "Suspended by signal " << WSTOPSIG(code) 
+            << " (" << strsignal(WSTOPSIG(code)) << ")" << "\n";
+    } else {
+        ttyerr << "Unknown exit status" << "\n";
+    }
+    return true;
 }
 
 #define DEFINE_KEY_HANDLER(name) \
-    void handle_key_##name(shell* sh)
+    int handle_key_##name(shell* sh)
 
 #define DEFINE_KEY_COMBO_HANDLER(key0, key1, key2) \
-    void handle_key_##key0##_##key1##_##key2(shell* sh)
+    int handle_key_##key0##_##key1##_##key2(shell* sh)
+
+#define DEFINE_BUILTIN_COMMAND(name) \
+    int builtin_command_##name(shell* sh, const vector<std::string>& args)
 
 #define ADD_KEYMAP(key) \
     this->keymap[key] = handle_key_##key
@@ -77,131 +146,231 @@ void handle_line(const std::string &line) {
 #define ADD_KEY_COMBO_MAP(key0, key1, key2) \
     this->key_combo_map[std::make_tuple(key0, key1, key2)] = handle_key_##key0##_##key1##_##key2
 
+#define ADD_BUILTIN_COMMAND(name) \
+    this->builtin_commands[#name] = builtin_command_##name
+
+////////// Builtin Commands //////////
+DEFINE_BUILTIN_COMMAND(exit) {
+    exit(0);
+}
+
+DEFINE_BUILTIN_COMMAND(cd) {
+    if (args.size() == 1) {
+        chdir(getenv(CONFIG_ENV_HOME));
+    } else {
+        chdir(args[1].c_str());
+    }
+    return 0;
+}
+
+DEFINE_BUILTIN_COMMAND(engi9875) {
+    ttyout << "ENGI-9875 Assignment #4\nStudent: Zhen Guan (202191382)" << "\n";
+    return 0;
+}
+
+DEFINE_BUILTIN_COMMAND(history) {
+    for (size_t i = 0; i < sh->history.size(); i++) {
+        ttyout << i << ": " << sh->history[i] << "\n";
+    }
+    return 0;
+}
+
+////////// Builtin Commands //////////
+
+
+////////// Tab ///////////
+DEFINE_KEY_HANDLER(9) {
+    std::string cwd = sh->get_cwd();
+    std::optional<std::string> match = sh->completion(*sh->e->input_buffer);
+
+    if (match.has_value()) {
+        sh->assign_input(match.value());
+    }
+
+    return STATUS_NOTHING_TO_DO;
+}
+////////// Tab ///////////
+
+
 ////////// Arrows //////////
 DEFINE_KEY_HANDLER(KEY_UP) {
-
+    if (sh->history_index > 0) {
+        --sh->history_index;
+        sh->assign_input(sh->history[sh->history_index]);
+    }
+    return STATUS_NOTHING_TO_DO;
 }
 
 DEFINE_KEY_HANDLER(KEY_DOWN) {
+    if (sh->history_index < sh->history.size()) {
+        ++sh->history_index;
 
+        if (sh->history_index == sh->history.size()) {
+            sh->clear_input();
+        } else {
+            sh->assign_input(sh->history[sh->history_index]);
+        }
+    }
+    return STATUS_NOTHING_TO_DO;
 }
 
 DEFINE_KEY_HANDLER(KEY_LEFT) {
     if (sh->e->cursor > 0) {
         --sh->e->cursor;
     }
+    return STATUS_NOTHING_TO_DO;
 }
 
 DEFINE_KEY_HANDLER(KEY_RIGHT) {
     if (sh->e->cursor < sh->e->input_buffer->length()) {
         ++sh->e->cursor;
     }
+    else {
+        handle_key_9(sh);
+    }
+    return STATUS_NOTHING_TO_DO;
 }
 
 // up,down,left,right: 65,66,68,67
-DEFINE_KEY_COMBO_HANDLER(27, 91, 65) { handle_key_KEY_UP(sh); }
+DEFINE_KEY_COMBO_HANDLER(27, 91, 65) { return handle_key_KEY_UP(sh); }
 
-DEFINE_KEY_COMBO_HANDLER(27, 91, 66) { handle_key_KEY_DOWN(sh); }
+DEFINE_KEY_COMBO_HANDLER(27, 91, 66) { return handle_key_KEY_DOWN(sh); }
 
-DEFINE_KEY_COMBO_HANDLER(27, 91, 68) { handle_key_KEY_LEFT(sh); }
+DEFINE_KEY_COMBO_HANDLER(27, 91, 68) { return handle_key_KEY_LEFT(sh); }
 
-DEFINE_KEY_COMBO_HANDLER(27, 91, 67) { handle_key_KEY_RIGHT(sh); }
+DEFINE_KEY_COMBO_HANDLER(27, 91, 67) { return handle_key_KEY_RIGHT(sh); }
 ////////// Arrows //////////
 
 
-////////// Enter ///////////
-DEFINE_KEY_HANDLER(KEY_ENTER) {
+////////// Del ///////////
+DEFINE_KEY_COMBO_HANDLER(27, 91, 51) {
+    // 27,91,51,126. Del has special handling
+    if (read_key() == 126) {
+        sh->e->input_buffer->erase(sh->e->cursor, 1);
+    }
+    return STATUS_NOTHING_TO_DO;
+}
+////////// Del ///////////
 
+
+////////// Enter ///////////
+DEFINE_KEY_HANDLER(10) {
+    disable_raw_mode();
+
+    // No matter what, we need to print a new line
+    ttyout << "\n";
+
+    const std::string_view trimmed_view = string_strip(*sh->e->input_buffer);
+    const std::string trimmed(trimmed_view.begin(), trimmed_view.end());
+    const auto parts = string_split(trimmed, " ");
+
+    if (trimmed.empty() || parts.empty()) {
+        enable_raw_mode();
+        return STATUS_NOTHING_TO_DO;
+    }
+
+    // History
+    if (sh->builtin_commands.contains(parts.front())) {
+        sh->builtin_commands[parts.front()](sh, parts);
+    } else if (handle_line(sh->e, *sh->e->input_buffer)) {
+        sh->history.push_back(*sh->e->input_buffer);
+        sh->history_index = sh->history.size();
+
+        if (sh->history.size() >= CONFIG_HISTORY_MAX) {
+            sh->history.pop_front();
+        }
+    }
+    enable_raw_mode();
+
+    sh->clear_input();
+    return STATUS_NOTHING_TO_DO;
 }
 
-DEFINE_KEY_HANDLER(10) {
-    handle_key_KEY_ENTER(sh);
+DEFINE_KEY_HANDLER(13) {
+    return handle_key_10(sh);
 }
 ////////// Enter ///////////
 
 
 ////////// Backspace ///////////
-DEFINE_KEY_HANDLER(KEY_BACKSPACE) {
+DEFINE_KEY_HANDLER(127) {
     if (sh->e->cursor > 0) {
         sh->e->input_buffer->erase(--sh->e->cursor, 1);
     }
+    return STATUS_NOTHING_TO_DO;
 }
 
-DEFINE_KEY_HANDLER(127) {
-    handle_key_KEY_BACKSPACE(sh);
-}
 ////////// Backspace ///////////
+
+
+////////// Ctrl + C ///////////
+DEFINE_KEY_HANDLER(3) {
+    // Ctrl + C
+    ttyout << "^C\n";
+    sh->clear_input();
+    return STATUS_NOTHING_TO_DO;
+}
+////////// Ctrl + C ///////////
+
+
+////////// Escape ///////////
+DEFINE_KEY_HANDLER(27) {
+    auto tuple = std::make_tuple(27, read_key(), read_key());
+    if (sh->key_combo_map.contains(tuple)) {
+        return sh->key_combo_map[tuple](sh);
+    }
+
+    return STATUS_NOTHING_TO_DO;
+}
+////////// Escape ///////////
 
 
 shell::shell(int argc, const char* argv[]) {
     this->e = new env();
-    ADD_KEYMAP(KEY_LEFT);
-    ADD_KEYMAP(KEY_RIGHT);
-    ADD_KEYMAP(KEY_BACKSPACE);
+
     ADD_KEYMAP(127);
+    ADD_KEYMAP(27);
+    ADD_KEYMAP(3);
+    ADD_KEYMAP(9); // tab
+    ADD_KEYMAP(10);
+    ADD_KEYMAP(13);
+
+    ADD_KEY_COMBO_MAP(27, 91, 51); // 126
     ADD_KEY_COMBO_MAP(27, 91, 65);
     ADD_KEY_COMBO_MAP(27, 91, 66);
     ADD_KEY_COMBO_MAP(27, 91, 68);
     ADD_KEY_COMBO_MAP(27, 91, 67);
 
-    win_width = getmaxx(stdscr);
-    win_height = getmaxy(stdscr);
-
-    // TODO: review line height limit?
-    win_input = newwin(2, win_width, 0, 0);
-    win_output = newwin(win_height - 1, win_width, 1, 0);
-
-    scrollok(win_output, true);
-}
-
-void shell::on_resized(int new_input_point_row, int new_input_point_col) {
-    // Horizontal: X
-    // Vertical: Y
-    win_width = getmaxx(stdscr);
-    win_height = getmaxy(stdscr);
-
-    wrefresh(win_input);
-    wrefresh(win_output);
-
-    wmove(win_input, new_input_point_row, new_input_point_col);
-    wmove(win_output, new_input_point_row + 1, 0);
-
-    scrollok(win_output, true);
+    ADD_BUILTIN_COMMAND(exit);
+    ADD_BUILTIN_COMMAND(cd);
+    ADD_BUILTIN_COMMAND(engi9875);
+    ADD_BUILTIN_COMMAND(history);
 }
 
 shell::~shell() {
     delete this->e;
 }
 
-int shell::handle_normal_key(int key) {
-    this->e->input_buffer->insert(e->input_buffer->begin() + this->e->cursor, static_cast<char>(key));
-    ++this->e->cursor;
+int shell::handle_printable_key(int key) {
+    this->e->input_buffer->insert(e->input_buffer->begin() + this->e->cursor++, static_cast<char>(key));
     return STATUS_NOTHING_TO_DO;
 }
 
 int shell::handle_control_key(int key) {
-    if (key == 3) {
-        // Ctrl + C
-        return STATUS_EXIT;
-    }
-    if (key == 27) {
-        // Escape
-        auto tuple = std::make_tuple(key, wgetch(win_input), wgetch(win_input));
-        if (this->key_combo_map.contains(tuple)) {
-            this->key_combo_map[tuple](this);
-            return STATUS_NOTHING_TO_DO;
-        }
-    }
-    if (key == KEY_ENTER) {
-        // render_input_area();
-    }
-
-    std::cerr << "key: " << key << ", cursor: " << e->cursor << std::endl;
-
     if (this->keymap.contains(key)) {
-        this->keymap[key](this);
+        return this->keymap[key](this);
     }
     return STATUS_NOTHING_TO_DO;
+}
+
+void shell::clear_input() {
+    this->e->input_buffer->clear();
+    this->e->cursor = 0;
+}
+
+void shell::assign_input(const std::string& input) {
+    this->e->input_buffer->assign(input);
+    this->e->cursor = this->e->input_buffer->length();
 }
 
 /**
@@ -211,10 +380,8 @@ int shell::handle_control_key(int key) {
 int shell::dispatch(int key) {
     if (iscntrl(key)) {
         return handle_control_key(key);
-    }
-
-    if (isprint(key)) {
-        return handle_normal_key(key);
+    } else if (isprint(key)) {
+        return handle_printable_key(key);
     }
 
     return STATUS_NOTHING_TO_DO;
@@ -226,54 +393,114 @@ std::string shell::get_cwd() {
     return cwd;
 }
 
-void shell::render_input_area() {
-    char ps[1024];
-    std::string cwd_path = get_cwd();
-    std::string_view cwd(cwd_path.begin() + cwd_path.rfind('/'), cwd_path.end());
-
-    int len = snprintf(ps, sizeof(ps), "➜ %s ", cwd.data());
-
-    wclear(win_input);
-
-    wattron(win_input, COLOR_PAIR(COLOR_SECONDARY));
-    mvwprintw(win_input, 0, 0, "%s", ps);
-    wattroff(win_input, COLOR_PAIR(COLOR_SECONDARY));
-
-    const std::string* input = this->e->input_buffer;
-    std::string first_param(input->begin(), input->begin() + input->find(' '));
-    std::string remain_param(input->begin() + input->find(' '), input->end());
-
-    if (is_in_PATH(first_param)) {
-        wattron(win_input, COLOR_PAIR(COLOR_SAFE));
-        mvwprintw(win_input, 0, len, "%s", first_param.c_str());
-        wattroff(win_input, COLOR_PAIR(COLOR_SAFE));
-    }
-    else {
-        wattron(win_input, COLOR_PAIR(COLOR_DANGER));
-        mvwprintw(win_input, 0, len, "%s", first_param.c_str());
-        wattroff(win_input, COLOR_PAIR(COLOR_DANGER));
+std::optional<std::string> shell::completion(const std::string& input) {
+    // Has unique match with in cwd or history?
+    if (input.empty()) {
+        return std::nullopt;
     }
 
-    mvwprintw(win_input, 0, len, "%s", remain_param.c_str());
-    wmove(win_input, 0, len + this->e->cursor);
-    wrefresh(win_input);
+    std::string prefix;
+    const auto parts = string_split(input, " ");
+    if (parts.size() > 0) {
+        prefix = string_join(std::vector(parts.begin(), parts.end() - 1), " ") + " ";
+    }
+
+    std::optional<std::string> match = unique_match(get_cwd(), parts.back());
+    if (match.has_value()) {
+        return prefix + match.value();
+    }
+
+    for (const auto& h : this->history) {
+        if (h.find(input) == 0) {
+            return h;
+        }
+    }
+
+    return std::nullopt;
 }
 
-// 639151484352536025
+void shell::render_input_area() {
+    const auto cwd_full = get_cwd();
+    const auto cwd = string_split(cwd_full, "/").back();
+    const auto ps = std::string("$ ")
+        .append(string_color(cwd, COLOR_BRIGHT_CYAN))
+        .append(" > ");
+    std::string hint;
+
+    // Preprocess input buffer
+    const auto input_buffer = *this->e->input_buffer;
+    const auto input_buffer_trimmed_view = string_strip(input_buffer);
+    const auto input_buffer_trimmed = std::string(input_buffer_trimmed_view.begin(), input_buffer_trimmed_view.end());
+
+    auto space_location = input_buffer.find(" ");
+    if (space_location == std::string::npos) {
+        space_location = input_buffer.length();
+    }
+
+    const auto parts = string_split(input_buffer_trimmed, " ");
+    hint = completion(input_buffer).value_or("");
+    if (!hint.empty()) {
+        hint = hint.substr(input_buffer.length());
+    }
+
+    // Found in builtin commands or PATH?
+    std::string first_part = input_buffer.substr(0, space_location);
+    const int color = (builtin_commands.contains(parts.front()) || is_in_PATH(parts.front()))
+        ? COLOR_BRIGHT_GREEN 
+        : COLOR_BRIGHT_RED;
+
+    // Original untrimmed remaining part
+    std::string remaining_part;    
+    if (space_location < input_buffer.length() - 1) {
+        remaining_part = input_buffer.substr(space_location);
+    }
+
+    std::string buffer = string_color(first_part, color) + remaining_part;
+
+    ttyout << "\r" 
+        << std::string(get_console_width() - ps.length(), ' ') 
+        << "\r"
+        << ps
+        << buffer
+        << string_color(hint, COLOR_GREY)
+        << "\r"
+        << ps
+        << string_color(input_buffer.substr(0, this->e->cursor), color, first_part.length()) /* adjust cursor */
+        << std::flush;
+}
+
 int shell::main_loop() {
     int key;
     int status;
 
+    signal_proxy = [this] (int sig) {
+        kill(e->child_process_id, sig);
+    };
+
+    signal(SIGINT, signal_proxy_wrapper);
+    signal(SIGTSTP, signal_proxy_wrapper);
+
+    // Warmup
+    is_in_PATH("dd");
+
+    enable_raw_mode();
     render_input_area();
 
     for (;;) {
-        if ((key = wgetch(win_input)) > 0) {
+        if ((key = read_key()) > 0) {
             status = dispatch(key);
             if (status != STATUS_NOTHING_TO_DO) {
                 break;
             }
+
             render_input_area();
         }
     }
+
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+
+    disable_raw_mode();
+
     return status;
 }

@@ -1,0 +1,6 @@
+/home/miku/project/mysh/build/motd/CMakeFiles/shsh.dir
+/home/miku/project/mysh/build/motd/CMakeFiles/edit_cache.dir
+/home/miku/project/mysh/build/motd/CMakeFiles/rebuild_cache.dir
+/home/miku/project/mysh/build/motd/motd/CMakeFiles/motd.dir
+/home/miku/project/mysh/build/motd/motd/CMakeFiles/edit_cache.dir
+/home/miku/project/mysh/build/motd/motd/CMakeFiles/rebuild_cache.dir

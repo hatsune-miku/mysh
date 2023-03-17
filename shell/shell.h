@@ -6,33 +6,38 @@
 
 #include "env/env.h"
 
-#include <ncurses.h>
 #include <string>
 #include <map>
+#include <deque>
+#include <vector>
+#include <functional>
+#include <optional>
 
 class shell {
 public:
     env* e;
-    std::map<int, std::function<void(shell* sh)>> keymap;
-    std::map<std::tuple<int, int, int>, std::function<void(shell* sh)>> key_combo_map;
-    WINDOW* win_input;
-    WINDOW* win_output;
-    int win_width;
-    int win_height;
+    std::map<int, std::function<int(shell* sh)>> keymap;
+    std::map<std::tuple<int, int, int>, std::function<int(shell* sh)>> key_combo_map;
+    std::map<std::string, std::function<int(shell* sh, const std::vector<std::string>& args)>> builtin_commands;
+
+    std::deque<std::string> history;
+    int history_index;
 
     shell(int argc, const char* argv[]);
     ~shell();
 
-    void render_input_area();
-    void flush();
-    int dispatch(int key);
-    void on_resized(int new_input_point_row, int new_input_point_col);
+    void clear_input();
+    void assign_input(const std::string& input);
 
-    int handle_normal_key(int key);
+    std::optional<std::string> completion(const std::string& input);
+
+    int dispatch(int key);
+    void render_input_area();
+
+    int handle_printable_key(int key);
     int handle_control_key(int key);
 
     std::string get_cwd();
 
     int main_loop();
 };
-

@@ -10,8 +10,10 @@
 
 class env {
 public:
-    std::string* buffer;
+    std::string* output_buffer;
     std::string* input_buffer;
+    int child_process_id;
+
     int cursor;
 
     env();

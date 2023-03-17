@@ -1,0 +1,1 @@
+clang++ -g CMakeFiles/shsh.dir/main.cpp.o CMakeFiles/shsh.dir/env/env.cpp.o CMakeFiles/shsh.dir/shell/shell.cpp.o CMakeFiles/shsh.dir/util/env_util.cpp.o CMakeFiles/shsh.dir/util/string_util.cpp.o CMakeFiles/shsh.dir/util/sig_util.cpp.o -o shsh 
